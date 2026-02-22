@@ -1,6 +1,6 @@
 # abeat
 
-Local-first agentic heartbeat runner for periodic AI-agent and CLI jobs.
+Local-first heartbeat runner to run periodic jobs  for AI assistant or AI agent workflows.
 
 `abeat` is designed to run on top of ordinary POSIX tools (`cron`, `systemd --user`, shell commands, local CLI tools) without requiring a daemon, external service, or a custom agent runtime.
 
