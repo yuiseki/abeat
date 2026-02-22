@@ -45,6 +45,8 @@ pub struct ActionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDefinitionFile {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub kind: String,
     pub enabled: bool,
     pub schedule_kind: String,
@@ -77,6 +79,7 @@ pub struct LoadedJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDefinition {
     pub id: Option<String>,
+    pub description: Option<String>,
     pub kind: Option<String>,
     pub enabled: Option<bool>,
     pub schedule_kind: Option<String>,
@@ -89,6 +92,7 @@ pub struct JobDefinition {
 pub struct JobSummary {
     pub source: String,
     pub id: String,
+    pub description: Option<String>,
     pub kind: Option<String>,
     pub enabled: Option<bool>,
     pub schedule_kind: Option<String>,
@@ -149,6 +153,7 @@ pub fn load_job_summaries(jobs_dir: &Path) -> Result<Vec<JobSummary>> {
         out.push(JobSummary {
             source: stem,
             id,
+            description: parsed.description,
             kind: parsed.kind,
             enabled: parsed.enabled,
             schedule_kind: parsed.schedule_kind,

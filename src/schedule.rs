@@ -107,6 +107,7 @@ mod tests {
             source_modified_at: None,
             def: JobDefinitionFile {
                 id: "sample".to_string(),
+                description: None,
                 kind: "heartbeat_check".to_string(),
                 enabled: true,
                 schedule_kind: "every".to_string(),

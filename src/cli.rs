@@ -89,7 +89,22 @@ pub struct SetCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SetSubcommand {
+    /// Set a single job state (alias-friendly form)
+    Job(SetJobArgs),
     Jobs(SetJobsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SetJobArgs {
+    pub id: String,
+    #[arg(value_enum)]
+    pub action: SetJobAction,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SetJobAction {
+    Enable,
+    Disable,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +134,8 @@ pub enum JobKindArg {
 pub struct SetJobsAddArgs {
     #[arg(long)]
     pub id: String,
+    #[arg(long)]
+    pub description: Option<String>,
     #[arg(long, value_enum)]
     pub kind: JobKindArg,
     #[arg(long)]

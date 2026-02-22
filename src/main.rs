@@ -1,9 +1,11 @@
+mod agent_adapter;
 mod cli;
 mod jobs;
 mod paths;
 mod schedule;
 mod state;
 
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use serde::Serialize;
 
 use cli::{
     AbeCommand, Cli, GetCommand, GetJobsArgs, GetSubcommand, JobKindArg, LogsArgs, SetCommand,
-    SetJobsAddArgs, SetJobsCommand, SetSubcommand, WhichArgs,
+    SetJobAction, SetJobsAddArgs, SetJobsCommand, SetSubcommand, WhichArgs,
 };
 use jobs::{
     JobDefinitionFile, JobSummary, LoadedJob, load_job_by_id, load_job_summaries, load_jobs,
@@ -195,6 +197,10 @@ fn cmd_get(paths: &AbeatPaths, cmd: GetCommand) -> Result<()> {
 
 fn cmd_set(paths: &AbeatPaths, cmd: SetCommand) -> Result<()> {
     match cmd.subcommand {
+        SetSubcommand::Job(args) => match args.action {
+            SetJobAction::Enable => cmd_set_job_enabled(paths, &args.id, true),
+            SetJobAction::Disable => cmd_set_job_enabled(paths, &args.id, false),
+        },
         SetSubcommand::Jobs(job_args) => match job_args.subcommand {
             SetJobsCommand::Add(args) => cmd_set_jobs_add(paths, args),
             SetJobsCommand::Update { id } => {
@@ -202,16 +208,8 @@ fn cmd_set(paths: &AbeatPaths, cmd: SetCommand) -> Result<()> {
                     "`abeat set jobs update {id}` is not implemented yet; edit the TOML file directly"
                 )
             }
-            SetJobsCommand::Enable { id } => {
-                bail!(
-                    "`abeat set jobs enable {id}` is not implemented yet; edit enabled=true in the TOML file"
-                )
-            }
-            SetJobsCommand::Disable { id } => {
-                bail!(
-                    "`abeat set jobs disable {id}` is not implemented yet; edit enabled=false in the TOML file"
-                )
-            }
+            SetJobsCommand::Enable { id } => cmd_set_job_enabled(paths, &id, true),
+            SetJobsCommand::Disable { id } => cmd_set_job_enabled(paths, &id, false),
             SetJobsCommand::Rm { id } => bail!(
                 "`abeat set jobs rm {id}` is not implemented yet; remove {} manually",
                 paths.jobs_dir().join(format!("{id}.toml")).display()
@@ -277,6 +275,7 @@ fn cmd_set_jobs_add(paths: &AbeatPaths, args: SetJobsAddArgs) -> Result<()> {
 
     let job = JobDefinitionFile {
         id: args.id.clone(),
+        description: args.description.clone(),
         kind: match args.kind {
             JobKindArg::HeartbeatCheck => "heartbeat_check".to_string(),
             JobKindArg::ScheduledTask => "scheduled_task".to_string(),
@@ -325,6 +324,29 @@ fn cmd_set_jobs_add(paths: &AbeatPaths, args: SetJobsAddArgs) -> Result<()> {
     fs::write(&path, toml).with_context(|| format!("failed to write {}", path.display()))?;
 
     println!("{}", path.display());
+    Ok(())
+}
+
+fn cmd_set_job_enabled(paths: &AbeatPaths, id: &str, enabled: bool) -> Result<()> {
+    let path = paths.jobs_dir().join(format!("{id}.toml"));
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+
+    let table = value
+        .as_table_mut()
+        .with_context(|| format!("job file must be a TOML table: {}", path.display()))?;
+    table.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+
+    let body = toml::to_string_pretty(&value).context("failed to serialize updated job TOML")?;
+    fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+
+    println!(
+        "{} {}",
+        if enabled { "enabled" } else { "disabled" },
+        path.display()
+    );
     Ok(())
 }
 
@@ -396,7 +418,7 @@ fn run_loaded_job(
     state_entry.last_run_id = Some(run_id.clone());
     state_entry.last_started_at = Some(started_at.to_rfc3339());
 
-    let execution = execute_job(job);
+    let execution = execute_job(paths, job, &run_id, trigger);
     let ended_at = Utc::now();
 
     let (stdout_bytes, stderr_bytes, exit_code, status, no_op, message) = match execution {
@@ -506,12 +528,448 @@ struct ExecutionOutcome {
     message: Option<String>,
 }
 
-fn execute_job(job: &LoadedJob) -> Result<ExecutionOutcome> {
+fn execute_job(
+    paths: &AbeatPaths,
+    job: &LoadedJob,
+    run_id: &str,
+    trigger: &str,
+) -> Result<ExecutionOutcome> {
     match job.def.action.mode.as_str() {
         "command" => execute_command_job(job),
-        "agent_cli" => bail!("agent_cli mode is not implemented yet for runtime execution"),
+        "agent_cli" => execute_agent_cli_job(paths, job, run_id, trigger),
         other => bail!("unsupported action.mode `{other}`"),
     }
+}
+
+fn execute_agent_cli_job(
+    paths: &AbeatPaths,
+    job: &LoadedJob,
+    run_id: &str,
+    trigger: &str,
+) -> Result<ExecutionOutcome> {
+    let built = build_agent_cli_prompt(paths, job, run_id, trigger)?;
+    let adapter_output = agent_adapter::run_one_shot(agent_adapter::AgentAdapterRequest {
+        agent: &job.def.agent,
+        workspace: Path::new(&job.def.workspace),
+        prompt: &built.prompt,
+    })?;
+
+    let normalized_stdout = if let Some(text) = adapter_output.normalized_text.as_deref() {
+        format!("{text}\n").into_bytes()
+    } else {
+        adapter_output.stdout.clone()
+    };
+    let stdout_for_noop = String::from_utf8_lossy(&normalized_stdout);
+    let no_op = detect_no_op(&stdout_for_noop, &job.def.no_op_token);
+
+    let message = if let Some(msg) = adapter_output.message {
+        Some(msg)
+    } else {
+        Some(format!(
+            "agent_cli:{} context={}",
+            job.def.agent,
+            built.context_path.display()
+        ))
+    };
+
+    Ok(ExecutionOutcome {
+        stdout: normalized_stdout,
+        stderr: adapter_output.stderr,
+        exit_code: adapter_output.exit_code,
+        success: adapter_output.success,
+        no_op,
+        message,
+    })
+}
+
+struct AgentPromptBuild {
+    prompt: String,
+    context_path: PathBuf,
+}
+
+fn build_agent_cli_prompt(
+    paths: &AbeatPaths,
+    job: &LoadedJob,
+    run_id: &str,
+    trigger: &str,
+) -> Result<AgentPromptBuild> {
+    let task_prompt = load_job_prompt(paths, job)?;
+    let mut sections: Vec<String> = Vec::new();
+
+    sections.push(format!(
+        "# abeat Job Context\n\n- job_id: `{}`\n- kind: `{}`\n- agent: `{}`\n- trigger: `{}`\n- workspace: `{}`\n- generated_at: `{}`\n",
+        job.def.id,
+        job.def.kind,
+        job.def.agent,
+        trigger,
+        job.def.workspace,
+        Utc::now().to_rfc3339()
+    ));
+
+    sections.push(format!(
+        "## No-Op Contract\n\nIf no action is needed, reply exactly `{}`.\n",
+        job.def.no_op_token
+    ));
+
+    if !job.def.skills.is_empty() {
+        sections.push(format!(
+            "## Declared Skills\n\n{}\n",
+            job.def
+                .skills
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if job.def.context.include_repo_agents_rules.unwrap_or(false) {
+        if let Some(agent_rules) = read_workspace_agents_md(job, 32 * 1024)? {
+            sections.push(format!("## AGENTS.md\n\n{}\n", agent_rules));
+        }
+    }
+
+    if let Some(n) = job.def.context.include_recent_runs {
+        if n > 0 {
+            let recent = load_recent_run_lines(paths, &job.def.id, n as usize)?;
+            if !recent.is_empty() {
+                sections.push(format!(
+                    "## Recent abeat Runs (same job)\n\n{}\n",
+                    recent
+                        .iter()
+                        .map(|l| format!("- {}", clip_for_context(l, 400)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+    }
+
+    if let Some(amem_section) = collect_amem_context(job)? {
+        sections.push(amem_section);
+    }
+
+    let extra_files = collect_extra_files(paths, job)?;
+    if !extra_files.is_empty() {
+        sections.push(extra_files);
+    }
+
+    sections.push(format!("## Task\n\n{}\n", task_prompt.trim()));
+
+    sections.push(
+        "## Output Contract\n\n- Return a concise plain-text result in Japanese unless the task prompt says otherwise.\n- If there is nothing to do, return the no-op token exactly.\n"
+            .to_string(),
+    );
+
+    let prompt = sections.join("\n");
+    let context_path = paths
+        .runtime_root
+        .join("cache")
+        .join("contexts")
+        .join(format!("{run_id}.md"));
+    if let Some(parent) = context_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&context_path, &prompt)
+        .with_context(|| format!("failed to write {}", context_path.display()))?;
+
+    Ok(AgentPromptBuild {
+        prompt,
+        context_path,
+    })
+}
+
+fn load_job_prompt(paths: &AbeatPaths, job: &LoadedJob) -> Result<String> {
+    if let Some(prompt) = job.def.action.prompt_inline.as_ref() {
+        return Ok(prompt.clone());
+    }
+
+    let template = job
+        .def
+        .action
+        .prompt_template
+        .as_deref()
+        .unwrap_or("heartbeat-default");
+
+    if let Some(builtin) = builtin_prompt_template(template, &job.def.no_op_token) {
+        if !template_path_candidates(paths, template)
+            .iter()
+            .any(|p| p.exists())
+        {
+            return Ok(builtin);
+        }
+    }
+
+    for path in template_path_candidates(paths, template) {
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read prompt template {}", path.display()))?;
+            return Ok(text);
+        }
+    }
+
+    bail!(
+        "prompt template `{}` not found under {} (and no built-in matched)",
+        template,
+        paths.config_root.join("prompts").display()
+    )
+}
+
+fn template_path_candidates(paths: &AbeatPaths, template: &str) -> Vec<PathBuf> {
+    let t = PathBuf::from(template);
+    let mut out = Vec::new();
+    if t.is_absolute() {
+        out.push(t);
+        return out;
+    }
+    out.push(paths.config_root.join("prompts").join(template));
+    if t.extension().is_none() {
+        out.push(
+            paths
+                .config_root
+                .join("prompts")
+                .join(format!("{template}.md")),
+        );
+    }
+    out
+}
+
+fn builtin_prompt_template(template: &str, no_op_token: &str) -> Option<String> {
+    match template {
+        "heartbeat-default" => Some(format!(
+            "You are running as a non-interactive scheduled AI agent job (abeat heartbeat).\nUse the provided context and perform the requested task.\nIf there is no meaningful work to do, reply exactly `{}`.\nIf work is done or findings exist, output a concise plain-text summary.\n",
+            no_op_token
+        )),
+        _ => None,
+    }
+}
+
+fn read_workspace_agents_md(job: &LoadedJob, max_bytes: usize) -> Result<Option<String>> {
+    let path = Path::new(&job.def.workspace).join("AGENTS.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(Some(truncate_bytes_for_context(&text, max_bytes)))
+}
+
+fn load_recent_run_lines(paths: &AbeatPaths, job_id: &str, limit: usize) -> Result<Vec<String>> {
+    let path = paths.runs_file();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines: Vec<String> = content
+        .lines()
+        .filter(|line| line.contains(&format!("\"job_id\":\"{job_id}\"")))
+        .map(|s| s.to_string())
+        .collect();
+    if lines.len() > limit {
+        let start = lines.len() - limit;
+        lines = lines.split_off(start);
+    }
+    Ok(lines)
+}
+
+fn collect_extra_files(paths: &AbeatPaths, job: &LoadedJob) -> Result<String> {
+    let mut sections = Vec::new();
+    for item in &job.def.context.extra_files {
+        let candidates = extra_file_candidates(paths, job, item);
+        let path = candidates.into_iter().find(|p| p.exists());
+        let Some(path) = path else {
+            continue;
+        };
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        sections.push(format!(
+            "### {}\n\n{}\n",
+            path.display(),
+            truncate_bytes_for_context(&text, 24 * 1024)
+        ));
+    }
+
+    if sections.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("## Extra Files\n\n{}", sections.join("\n")))
+    }
+}
+
+fn extra_file_candidates(paths: &AbeatPaths, job: &LoadedJob, item: &str) -> Vec<PathBuf> {
+    let p = PathBuf::from(item);
+    if p.is_absolute() {
+        return vec![p];
+    }
+    vec![
+        Path::new(&job.def.workspace).join(item),
+        paths.config_root.join("context").join(item),
+    ]
+}
+
+fn collect_amem_context(job: &LoadedJob) -> Result<Option<String>> {
+    let mode = job
+        .def
+        .context
+        .amem_mode
+        .as_deref()
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    if mode == "off" {
+        return Ok(None);
+    }
+
+    let amem_bin = match resolve_amem_bin() {
+        Some(bin) => bin,
+        None => {
+            if mode == "on" {
+                bail!("amem_mode=on but `amem` command was not found");
+            }
+            return Ok(Some(
+                "## amem Integration\n\n- status: unavailable (auto mode, skipped)\n".to_string(),
+            ));
+        }
+    };
+
+    let mut blocks = vec![format!(
+        "## amem Integration\n\n- binary: `{}`\n",
+        amem_bin.display()
+    )];
+    let mut errors = Vec::new();
+
+    let need_today = job.def.context.amem_today.unwrap_or(false)
+        || job.def.context.amem_owner_profile.unwrap_or(false)
+        || job.def.context.amem_open_tasks.unwrap_or(false);
+    if need_today {
+        match run_capture_text(
+            &amem_bin,
+            &["today", "--json"],
+            Path::new(&job.def.workspace),
+        ) {
+            Ok(out) => blocks.push(format!(
+                "### amem today --json\n\n```json\n{}\n```\n",
+                clip_for_codeblock(&out, 32 * 1024)
+            )),
+            Err(err) => errors.push(format!("amem today --json failed: {err}")),
+        }
+    }
+
+    if let Some(period) = job.def.context.amem_recent_activity_period.as_deref() {
+        match run_capture_text(
+            &amem_bin,
+            &["get", "acts", period, "--detail"],
+            Path::new(&job.def.workspace),
+        ) {
+            Ok(out) => blocks.push(format!(
+                "### amem get acts {} --detail\n\n```text\n{}\n```\n",
+                period,
+                clip_for_codeblock(&out, 24 * 1024)
+            )),
+            Err(err) => errors.push(format!("amem get acts {period} failed: {err}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        if mode == "on" {
+            bail!("{}", errors.join("; "));
+        }
+        blocks.push(format!(
+            "### amem warnings\n\n{}\n",
+            errors
+                .into_iter()
+                .map(|e| format!("- {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    Ok(Some(blocks.join("\n")))
+}
+
+fn resolve_amem_bin() -> Option<PathBuf> {
+    if let Ok(v) = env::var("ABEAT_AMEM_BIN") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
+    }
+    if command_exists_in_path("amem") {
+        return Some(PathBuf::from("amem"));
+    }
+    let fallback = PathBuf::from("/home/yuiseki/Workspaces/repos/amem/target/debug/amem");
+    if fallback.exists() {
+        return Some(fallback);
+    }
+    None
+}
+
+fn command_exists_in_path(bin: &str) -> bool {
+    let Some(path_os) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path_os).any(|dir| {
+        let candidate = dir.join(bin);
+        candidate.exists()
+    })
+}
+
+fn run_capture_text(bin: &Path, args: &[&str], cwd: &Path) -> Result<String> {
+    let output = Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run `{}`", bin.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{} exited with status {}: {}{}",
+            bin.display(),
+            output.status,
+            stderr.trim(),
+            if stderr.trim().is_empty() && !stdout.trim().is_empty() {
+                format!(" | stdout: {}", clip_for_context(&stdout, 400))
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn clip_for_codeblock(s: &str, max_bytes: usize) -> String {
+    truncate_bytes_for_context(s, max_bytes)
+}
+
+fn clip_for_context(s: &str, max_chars: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut out = String::new();
+    for (i, ch) in collapsed.chars().enumerate() {
+        if i + 1 >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn truncate_bytes_for_context(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n...[truncated]...");
+    out
 }
 
 fn execute_command_job(job: &LoadedJob) -> Result<ExecutionOutcome> {
@@ -610,12 +1068,12 @@ fn make_run_id(job_id: &str, now: chrono::DateTime<Utc>) -> String {
 
 fn print_jobs_table(jobs: &[JobSummary]) {
     println!(
-        "{:<20} {:<16} {:<16} {:<8} {:<10} {:<12}",
-        "ID", "KIND", "SCHEDULE", "ENABLED", "AGENT", "SOURCE"
+        "{:<20} {:<16} {:<16} {:<8} {:<10} {}",
+        "ID", "KIND", "SCHEDULE", "ENABLED", "AGENT", "DESCRIPTION"
     );
     for job in jobs {
         println!(
-            "{:<20} {:<16} {:<16} {:<8} {:<10} {:<12}",
+            "{:<20} {:<16} {:<16} {:<8} {:<10} {}",
             truncate(&job.id, 20),
             truncate(job.kind.as_deref().unwrap_or("-"), 16),
             truncate(&job.schedule_display(), 16),
@@ -625,7 +1083,7 @@ fn print_jobs_table(jobs: &[JobSummary]) {
                 "no"
             },
             truncate(job.agent.as_deref().unwrap_or("-"), 10),
-            truncate(&job.source, 12),
+            truncate(job.description.as_deref().unwrap_or("-"), 48),
         );
     }
 }
