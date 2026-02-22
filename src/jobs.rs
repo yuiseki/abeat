@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,10 @@ pub struct ActionConfig {
     pub prompt_template: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_inline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,15 @@ pub struct JobDefinitionFile {
     pub timeout: Option<String>,
     pub context: ContextConfig,
     pub action: ActionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedJob {
+    pub source_name: String,
+    #[allow(dead_code)]
+    pub source_path: PathBuf,
+    pub source_modified_at: Option<SystemTime>,
+    pub def: JobDefinitionFile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,4 +160,58 @@ pub fn load_job_summaries(jobs_dir: &Path) -> Result<Vec<JobSummary>> {
 
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
+}
+
+pub fn load_jobs(jobs_dir: &Path) -> Result<Vec<LoadedJob>> {
+    if !jobs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in
+        fs::read_dir(jobs_dir).with_context(|| format!("failed to read {}", jobs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let source_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let def: JobDefinitionFile =
+            toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+        let source_modified_at = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        out.push(LoadedJob {
+            source_name,
+            source_path: path,
+            source_modified_at,
+            def,
+        });
+    }
+
+    out.sort_by(|a, b| a.def.id.cmp(&b.def.id));
+    Ok(out)
+}
+
+pub fn load_job_by_id(jobs_dir: &Path, id: &str) -> Result<LoadedJob> {
+    let path = jobs_dir.join(format!("{id}.toml"));
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let def: JobDefinitionFile =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let source_modified_at = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    Ok(LoadedJob {
+        source_name: id.to_string(),
+        source_path: path,
+        source_modified_at,
+        def,
+    })
 }

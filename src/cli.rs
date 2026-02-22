@@ -145,4 +145,10 @@ pub struct SetJobsAddArgs {
     pub prompt_template: Option<String>,
     #[arg(long)]
     pub prompt_inline: Option<String>,
+    /// Execute a shell command (uses action.mode=command)
+    #[arg(long = "exec")]
+    pub exec_command: Option<String>,
+    /// Shell binary for --exec (default: bash)
+    #[arg(long)]
+    pub shell: Option<String>,
 }

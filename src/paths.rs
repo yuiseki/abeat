@@ -18,6 +18,26 @@ impl AbeatPaths {
         self.runtime_root.join("logs")
     }
 
+    pub fn state_file(&self) -> PathBuf {
+        self.runtime_root.join("state/jobs-state.json")
+    }
+
+    pub fn runs_file(&self) -> PathBuf {
+        self.runtime_root.join("logs/runs.jsonl")
+    }
+
+    pub fn stdout_logs_dir(&self) -> PathBuf {
+        self.runtime_root.join("logs/stdout")
+    }
+
+    pub fn stderr_logs_dir(&self) -> PathBuf {
+        self.runtime_root.join("logs/stderr")
+    }
+
+    pub fn locks_dir(&self) -> PathBuf {
+        self.runtime_root.join("state/locks")
+    }
+
     pub fn config_dirs(&self) -> Vec<PathBuf> {
         vec![
             self.config_root.clone(),
@@ -25,6 +45,7 @@ impl AbeatPaths {
             self.config_root.join("prompts"),
             self.config_root.join("adapters"),
             self.config_root.join("context"),
+            self.config_root.join("scripts"),
         ]
     }
 
