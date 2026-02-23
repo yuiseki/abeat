@@ -9,6 +9,39 @@ It uses:
 - `~/.config/abeat/` for job definitions and config
 - `~/.abeat/` for runtime state, logs, locks, and cached context artifacts
 
+## Architecture
+
+```mermaid
+flowchart TD
+    cron["cron / systemd timer"]
+    tick["abeat tick --due"]
+    state["~/.abeat/state/jobs-state.json"]
+    jobs["~/.config/abeat/jobs/*.toml"]
+    logs["~/.abeat/logs/runs.jsonl"]
+
+    subgraph exec["Job execution"]
+        shell["shell command\n(mode = command)"]
+        agent["agent_cli adapter\n(gemini, claude, codex, opencode)"]
+        context["context prompt\n~/.abeat/cache/contexts/"]
+    end
+
+    amem["amem\n(context injection)"]
+    ai["AI CLI\n(gemini / claude / codex / opencode)"]
+
+    cron -->|every 5 min| tick
+    tick -->|read| jobs
+    tick -->|check last_run| state
+    tick -->|run due jobs| exec
+    shell -->|write| logs
+    agent -->|build context| context
+    context -->|inject| ai
+    amem -->|amem today| context
+    ai -->|output| logs
+    tick -->|update| state
+```
+
+**Key design principle:** `abeat` is a stateless one-shot runner, not a daemon. It relies on the OS scheduler (`cron` or `systemd --user`) to be invoked periodically. Each `abeat tick --due` run checks all enabled jobs, executes only those past their schedule, and records results to `runs.jsonl`.
+
 ## What `abeat` Does
 
 - runs due jobs with `abeat tick --due` (one-shot scheduler tick)
