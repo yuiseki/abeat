@@ -494,18 +494,85 @@ fn run_loaded_job(
     Ok(())
 }
 
+/// Takes the lock for a job, or reports that somebody else holds it.
+///
+/// A lock is released by `JobLock::drop`, which does not run when the process
+/// is killed: an OOM kill, a SIGKILL or a power cut all leave the file behind.
+/// Before this checked, such a lock stopped its job forever, and the log filled
+/// with `Skipped (locked)` every tick. Five jobs on one machine sat wedged that
+/// way, one of them for four months.
+///
+/// So a lock names its owner, and a lock whose owner is gone is taken over.
 fn try_acquire_job_lock(paths: &AbeatPaths, job_id: &str) -> Result<Option<JobLock>> {
     fs::create_dir_all(paths.locks_dir())
         .with_context(|| format!("failed to create {}", paths.locks_dir().display()))?;
     let path = paths.locks_dir().join(format!("{job_id}.lock"));
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            let _ = writeln!(file, "pid={}", std::process::id());
-            let _ = writeln!(file, "started_at={}", Utc::now().to_rfc3339());
-            Ok(Some(JobLock { path }))
+
+    match create_lock_file(&path) {
+        Ok(lock) => return Ok(Some(lock)),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to create lock {}", path.display()));
         }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("failed to create lock {}", path.display())),
+    }
+
+    match read_lock_owner(&path) {
+        Some(pid) if process_is_alive(pid) => Ok(None),
+        owner => {
+            match owner {
+                Some(pid) => eprintln!(
+                    "Taking over the lock for {job_id}: pid {pid} is gone",
+                ),
+                None => eprintln!(
+                    "Taking over the lock for {job_id}: it names no running process",
+                ),
+            }
+            // Remove and retry once. If another tick is doing the same thing at
+            // the same moment, one of them wins and the other is told the job is
+            // locked, which is the right answer for that one.
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(err)
+                        .with_context(|| format!("failed to clear stale lock {}", path.display()));
+                }
+            }
+            match create_lock_file(&path) {
+                Ok(lock) => Ok(Some(lock)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+                Err(err) => Err(err)
+                    .with_context(|| format!("failed to create lock {}", path.display())),
+            }
+        }
+    }
+}
+
+fn create_lock_file(path: &Path) -> io::Result<JobLock> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let _ = writeln!(file, "pid={}", std::process::id());
+    let _ = writeln!(file, "started_at={}", Utc::now().to_rfc3339());
+    Ok(JobLock {
+        path: path.to_path_buf(),
+    })
+}
+
+/// The pid a lock file names, if it names one this can read.
+fn read_lock_owner(path: &Path) -> Option<u32> {
+    let body = fs::read_to_string(path).ok()?;
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("pid=")?.trim().parse::<u32>().ok())
+}
+
+/// Whether a process is still running.
+///
+/// Linux answers from /proc. Anywhere else this says yes, because a lock that
+/// might belong to a living process must not be taken: refusing to run is
+/// recoverable, running twice may not be.
+fn process_is_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        true
     }
 }
 
@@ -1134,5 +1201,86 @@ mod tests {
         assert!(detect_no_op("HEARTBEAT_OK\n", "HEARTBEAT_OK"));
         assert!(detect_no_op("work\nHEARTBEAT_OK\n", "HEARTBEAT_OK"));
         assert!(!detect_no_op("work\nok\n", "HEARTBEAT_OK"));
+    }
+
+    fn paths_in(dir: &std::path::Path) -> AbeatPaths {
+        AbeatPaths {
+            config_root: dir.join("config"),
+            runtime_root: dir.join("runtime"),
+        }
+    }
+
+    /// A pid that belonged to a process which has already exited.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+        child.wait().expect("wait for it");
+        pid
+    }
+
+    fn write_lock(paths: &AbeatPaths, job_id: &str, body: &str) -> PathBuf {
+        let dir = paths.locks_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{job_id}.lock"));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_lock_held_by_a_living_process_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // This test process is alive, so its lock is a real one.
+        write_lock(&paths, "job", &format!("pid={}\nstarted_at=now\n", std::process::id()));
+
+        assert!(try_acquire_job_lock(&paths, "job").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lock_whose_owner_is_gone_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // Drop is the only thing that removes a lock, and it does not run when
+        // a process is killed. The job would otherwise never run again.
+        write_lock(&paths, "job", &format!("pid={}\nstarted_at=now\n", dead_pid()));
+
+        let lock = try_acquire_job_lock(&paths, "job").unwrap();
+        assert!(lock.is_some());
+
+        // The lock now names this process, and releasing it removes the file.
+        let path = paths.locks_dir().join("job.lock");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains(&format!("pid={}", std::process::id())), "{body}");
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_lock_that_names_no_owner_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // A lock left half-written by a kill names nobody. Nothing can be
+        // waiting on it, so it is stale by definition.
+        write_lock(&paths, "job", "");
+
+        assert!(try_acquire_job_lock(&paths, "job").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_free_job_is_locked_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let path = paths.locks_dir().join("job.lock");
+
+        let lock = try_acquire_job_lock(&paths, "job").unwrap();
+        assert!(lock.is_some());
+        assert!(path.exists());
+        // A second attempt while the first is held gets nothing.
+        assert!(try_acquire_job_lock(&paths, "job").unwrap().is_none());
+
+        drop(lock);
+        assert!(!path.exists());
     }
 }
